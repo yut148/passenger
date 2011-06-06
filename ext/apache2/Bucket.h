@@ -27,15 +27,25 @@
 
 #include <boost/shared_ptr.hpp>
 #include <apr_buckets.h>
+#include <queue>
 #include "Session.h"
+#include <Utils/Dechunker.h>
 
 namespace Passenger {
 
+using namespace std;
 using namespace boost;
 
 struct PassengerBucketState {
-	/** The number of bytes that this PassengerBucket has read so far. */
-	unsigned long bytesRead;
+	/** The associated session and stream file descriptor. */
+	SessionPtr session;
+	int stream;
+	
+	/** Set 'chunked' to true to enable dechunking of data. */
+	Dechunker dechunker;
+	queue<StaticString> remainingChunks;
+	char *chunkBuffer;
+	bool chunked;
 	
 	/** Whether this PassengerBucket is completed, i.e. no more data
 	 * can be read from the underlying file descriptor. When true,
@@ -52,9 +62,18 @@ struct PassengerBucketState {
 	int errorCode;
 	
 	PassengerBucketState() {
-		bytesRead = 0;
-		completed = false;
-		errorCode = 0;
+		stream      = -1;
+		chunkBuffer = NULL;
+		chunked     = false;
+		bytesRead   = 0;
+		completed   = false;
+		errorCode   = 0;
+	}
+	
+	~PassengerBucketState() {
+		if (chunkBuffer != NULL) {
+			apr_bucket_free(chunkBuffer);
+		}
 	}
 };
 
@@ -78,8 +97,7 @@ typedef shared_ptr<PassengerBucketState> PassengerBucketStatePtr;
  *   strange I/O problems.
  * - It can store its current state in a PassengerBucketState data structure.
  */
-apr_bucket *passenger_bucket_create(SessionPtr session,
-                                    PassengerBucketStatePtr state,
+apr_bucket *passenger_bucket_create(PassengerBucketStatePtr state,
                                     apr_bucket_alloc_t *list);
 
 } // namespace Passenger

@@ -725,8 +725,10 @@ private:
 			
 			/* Setup the bucket brigade. */
 			bucketState = ptr(new PassengerBucketState());
+			bucketState->session = session;
+			bucketState->stream  = session->getStream();
 			bb = apr_brigade_create(r->connection->pool, r->connection->bucket_alloc);
-			b = passenger_bucket_create(session, bucketState, r->connection->bucket_alloc);
+			b = passenger_bucket_create(bucketState, r->connection->bucket_alloc);
 			
 			/* The bucket (b) still has a reference to the session, so the reset()
 			 * call here is guaranteed not to throw any exceptions.
@@ -758,6 +760,10 @@ private:
 				 * backend process! Proceed with passing the bucket brigade,
 				 * for forwarding the response body to the HTTP client.
 				 */
+				
+				const char *transferEncoding = apr_table_get(r->headers_out, "Transfer-Encoding");
+				bucketState->chunked = transferEncoding != NULL
+					&& strcmp(transferEncoding, "chunked") == 0;
 				
 				/* Manually set the Status header because
 				 * ap_scan_script_header_err_brigade() filters it
