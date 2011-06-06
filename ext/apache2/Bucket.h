@@ -41,11 +41,11 @@ struct PassengerBucketState {
 	SessionPtr session;
 	int stream;
 	
-	/** Set 'chunked' to true to enable dechunking of data. */
+	/** Dechunking support fields. */
 	Dechunker dechunker;
-	queue<StaticString> remainingChunks;
+	queue<StaticString> chunks;
 	char *chunkBuffer;
-	bool chunked;
+	int chunkBufferSize;
 	
 	/** Whether this PassengerBucket is completed, i.e. no more data
 	 * can be read from the underlying file descriptor. When true,
@@ -64,17 +64,17 @@ struct PassengerBucketState {
 	PassengerBucketState() {
 		stream      = -1;
 		chunkBuffer = NULL;
-		chunked     = false;
-		bytesRead   = 0;
 		completed   = false;
 		errorCode   = 0;
 	}
 	
 	~PassengerBucketState() {
 		if (chunkBuffer != NULL) {
-			apr_bucket_free(chunkBuffer);
+			delete[] chunkBuffer;
 		}
 	}
+	
+	void enableDechunking();
 };
 
 typedef shared_ptr<PassengerBucketState> PassengerBucketStatePtr;

@@ -23,6 +23,7 @@
  *  THE SOFTWARE.
  */
 #include "Bucket.h"
+#include <Logging.h>
 #include <cassert>
 
 namespace Passenger {
@@ -69,151 +70,27 @@ bucket_destroy(void *data) {
 	}
 }
 
-
-struct DechunkState {
-	PassengerBucketState *passengerBucketState;
-	unsigned int iteration;
-	const char **str;
-	apr_size_t *len;
-	apr_bucket *bucket;
-	apr_status_t result;
-};
-
 static void
 onChunkData(const char *data, size_t size, void *userData) {
-	DechunkState *state = (DechunkState *) userData;
-	
-	if (state->result != APR_SUCCESS) {
-		// Previous callback set error state.
-		return;
-	}
-	
-	char *buf = (char *) apr_bucket_alloc(size, state->bucket->list);
-	if (buf == NULL) {
-		state->result = APR_ENOMEM;
-		return;
-	}
-	
-	memcpy(buf, data, size);
-	
-	if (state->iteration == 0) {
-		*state->str = buf;
-		*state->len = (apr_size_t) size;
-		
-		state->bucket = apr_bucket_heap_make(state->bucket, data, size, apr_bucket_free);
-		apr_bucket_heap *h = (apr_bucket_heap *) bucket->data;
-		h->alloc_len = size; /* note the real buffer size */
-	}
-	
-	*str = buf;
-	*len = ret;
-	bucket->data = NULL;
-	
-	/* Change the current bucket (which is a Passenger Bucket) into a heap bucket
-	 * that contains the data that we just read. This newly created heap bucket
-	 * will be the first in the bucket list.
-	 */
-	bucket = apr_bucket_heap_make(bucket, buf, *len, apr_bucket_free);
-	h = (apr_bucket_heap *) bucket->data;
-	h->alloc_len = APR_BUCKET_BUFF_SIZE; /* note the real buffer size */
-	
-	/* And after this newly created bucket we insert a new Passenger Bucket
-	 * which can read the next chunk from the stream.
-	 */
-	APR_BUCKET_INSERT_AFTER(bucket, passenger_bucket_create(
-		data->state, bucket->list));
-	
-	/* The newly created Passenger Bucket has a reference to the session
-	 * object, so we can delete data here.
-	 */
-	delete data;
-	
-	return APR_SUCCESS;
+	PassengerBucketState *state = (PassengerBucketState *) userData;
+	state->chunks.push(StaticString(data, size));
 }
 
-static apr_status_t
-bucket_read2(apr_bucket *bucket, const char **str, apr_size_t *len, apr_read_type_e block) {
-	BucketData *data;
-	PassengerBucketState *state;
-	char buf[1024 * 32];
-	ssize_t ret;
-	
-	data  = (BucketData *) bucket->data;
-	state = data->state.get();
-	*str  = NULL;
-	*len  = 0;
-	
-	if (block == APR_NONBLOCK_READ) {
-		/*
-		 * The bucket brigade that Hooks::handleRequest() passes using
-		 * ap_pass_brigade() is always passed through ap_content_length_filter,
-		 * which is a filter which attempts to read all data from the
-		 * bucket brigade and computes the Content-Length header from
-		 * that. We don't want this to happen; because suppose that the
-		 * Rails application sends back 1 GB of data, then
-		 * ap_content_length_filter will buffer this entire 1 GB of data
-		 * in memory before passing it to the HTTP client.
-		 *
-		 * ap_content_length_filter aborts and passes the bucket brigade
-		 * down the filter chain when it encounters an APR_EAGAIN, except
-		 * for the first read. So by returning APR_EAGAIN on every
-		 * non-blocking read request, we can prevent ap_content_length_filter
-		 * from buffering all data.
-		 */
-		return APR_EAGAIN;
-	}
-	
-	do {
-		ret = read(state->stream, buf, sizeof(buf));
-	} while (ret == -1 && errno == EINTR);
-	
-	
-	
-	if (ret > 0) {
-		DechunkingState dechunkState;
-		dechunkState.passengerBucketState = state;
-		dechunkState.iteration = 0;
-		dechunkState.str = str;
-		dechunkState.len = len;
-		dechunkState.bucket = bucket;
-		dechunkState.result = APR_SUCCESS;
-		state->dechunker.onData   = onChunkData;
-		state->dechunker.userData = &dechunkState;
-		assert(state->dechunker.acceptingInput());
-		size_t fed = state->dechunker.feed(buf, ret);
-		return dechunkState.result;
-		
-	} else if (ret == 0) {
-		state->completed = true;
-		delete data;
-		bucket->data = NULL;
-		
-		apr_bucket_free(buf);
-		
-		bucket = apr_bucket_immortal_make(bucket, "", 0);
-		*str = (const char *) bucket->data;
-		*len = 0;
-		return APR_SUCCESS;
-		
-	} else /* ret == -1 */ {
-		int e = errno;
-		state->completed = true;
-		state->errorCode = e;
-		delete data;
-		bucket->data = NULL;
-		apr_bucket_free(buf);
-		return APR_FROM_OS_ERROR(e);
-	}
+void
+PassengerBucketState::enableDechunking() {
+	chunkBufferSize = 1024 * 32;
+	chunkBuffer = new char[chunkBufferSize];
+	dechunker.onData = onChunkData;
+	dechunker.userData = this;
 }
-
-
 
 static apr_status_t
 bucket_read(apr_bucket *bucket, const char **str, apr_size_t *len, apr_read_type_e block) {
 	PassengerBucketStatePtr state;
 	BucketData *data;
-	char *buf;
+	char *buf = NULL;
 	ssize_t ret;
+	bool sync = false;
 	
 	data  = (BucketData *) bucket->data;
 	state = data->state;
@@ -240,22 +117,39 @@ bucket_read(apr_bucket *bucket, const char **str, apr_size_t *len, apr_read_type
 		return APR_EAGAIN;
 	}
 	
-	if (state->chunked) {
-		if (state->remainingChunks.empty()) {
-			buf = (char *) alloca(APR_BUCKET_BUFF_SIZE);
+	if (state->chunkBuffer != NULL) {
+		int e = 0;
+		
+		if (state->chunks.empty()) {
+			bool done = false;
 			do {
 				do {
-					ret = read(state->stream, buf, APR_BUCKET_BUFF_SIZE);
+					ret = read(state->stream, state->chunkBuffer,
+						state->chunkBufferSize);
 				} while (ret == -1 && errno == EINTR);
-			} while ();
+				if (ret <= 0) {
+					e = errno;
+					done = true;
+				} else {
+					P_WARN("Feeding");
+					state->dechunker.feed(state->chunkBuffer, ret);
+					P_WARN("Parsed " << state->chunks.size() << " chunks");
+				}
+			} while (!done && state->chunks.empty());
+		}
+		
+		if (e != 0) {
+			ret = -1;
+			errno = e;
+		} else if (!state->chunks.empty()) {
+			StaticString chunk = state->chunks.front();
+			buf = (char *) apr_bucket_alloc(chunk.size(), bucket->list);
+			ret = (ssize_t) chunk.size();
+			memcpy(buf, chunk.data(), chunk.size());
+			state->chunks.pop();
+			sync = state->chunks.empty();
 		} else {
-			buf = state->remainingChunks.front().data();
-			ret = (ssize_t) state->remainingChunks.front().size();
-			state->remainingChunks.pop();
-			if (state->remainingChunk.empty()) {
-				apr_bucket_free(state->chunkBuffer);
-				state->chunkBuffer = NULL;
-			}
+			ret = 0;
 		}
 		
 	} else {
@@ -271,115 +165,6 @@ bucket_read(apr_bucket *bucket, const char **str, apr_size_t *len, apr_read_type
 	if (ret > 0) {
 		apr_bucket_heap *h;
 		
-		if (state->chunked) {
-			vector<StaticString> chunks;
-			size_t i;
-			
-			state->dechunker.onData = onChunkData;
-			state->dechunker.userData = &chunks;
-			state->dechunker.feed(buf, ret);
-			
-			for (i = 1; i < chunks.size(); i++) {
-				
-			}
-		} else {
-			*str = buf;
-			*len = ret;
-			bucket->data = NULL;
-			
-			/* Change the current bucket (which is a Passenger Bucket) into a heap bucket
-			 * that contains the data that we just read. This newly created heap bucket
-			 * will be the first in the bucket list.
-			 */
-			bucket = apr_bucket_heap_make(bucket, buf, *len, apr_bucket_free);
-			h = (apr_bucket_heap *) bucket->data;
-			h->alloc_len = APR_BUCKET_BUFF_SIZE; /* note the real buffer size */
-			
-			/* And after this newly created bucket we insert a new Passenger Bucket
-			 * which can read the next chunk from the stream.
-			 */
-			APR_BUCKET_INSERT_AFTER(bucket, passenger_bucket_create(
-				data->state, bucket->list));
-			
-			/* The newly created Passenger Bucket has a reference to the session
-			 * object, so we can delete data here.
-			 */
-			delete data;
-			
-			return APR_SUCCESS;
-		}
-		
-	} else if (ret == 0) {
-		state->completed = true;
-		delete data;
-		bucket->data = NULL;
-		
-		if (!state->chunked) {
-			apr_bucket_free(buf);
-		}
-		
-		bucket = apr_bucket_immortal_make(bucket, "", 0);
-		*str = (const char *) bucket->data;
-		*len = 0;
-		return APR_SUCCESS;
-		
-	} else /* ret == -1 */ {
-		int e = errno;
-		state->completed = true;
-		state->errorCode = e;
-		delete data;
-		bucket->data = NULL;
-		if (!state->chunked) {
-			apr_bucket_free(buf);
-		}
-		return APR_FROM_OS_ERROR(e);
-	}
-}
-
-static apr_status_t
-bucket_read(apr_bucket *bucket, const char **str, apr_size_t *len, apr_read_type_e block) {
-	char *buf;
-	ssize_t ret;
-	BucketData *data;
-	PassengerBucketStatePtr state;
-	
-	data  = (BucketData *) bucket->data;
-	state = data->state;
-	*str  = NULL;
-	*len  = 0;
-	
-	if (block == APR_NONBLOCK_READ) {
-		/*
-		 * The bucket brigade that Hooks::handleRequest() passes using
-		 * ap_pass_brigade() is always passed through ap_content_length_filter,
-		 * which is a filter which attempts to read all data from the
-		 * bucket brigade and computes the Content-Length header from
-		 * that. We don't want this to happen; because suppose that the
-		 * Rails application sends back 1 GB of data, then
-		 * ap_content_length_filter will buffer this entire 1 GB of data
-		 * in memory before passing it to the HTTP client.
-		 *
-		 * ap_content_length_filter aborts and passes the bucket brigade
-		 * down the filter chain when it encounters an APR_EAGAIN, except
-		 * for the first read. So by returning APR_EAGAIN on every
-		 * non-blocking read request, we can prevent ap_content_length_filter
-		 * from buffering all data.
-		 */
-		return APR_EAGAIN;
-	}
-	
-	buf = (char *) apr_bucket_alloc(APR_BUCKET_BUFF_SIZE, bucket->list);
-	if (buf == NULL) {
-		return APR_ENOMEM;
-	}
-	
-	do {
-		ret = read(state->stream, buf, APR_BUCKET_BUFF_SIZE);
-	} while (ret == -1 && errno == EINTR);
-	
-	if (ret > 0) {
-		apr_bucket_heap *h;
-		
 		*str = buf;
 		*len = ret;
 		bucket->data = NULL;
@@ -391,6 +176,14 @@ bucket_read(apr_bucket *bucket, const char **str, apr_size_t *len, apr_read_type
 		bucket = apr_bucket_heap_make(bucket, buf, *len, apr_bucket_free);
 		h = (apr_bucket_heap *) bucket->data;
 		h->alloc_len = APR_BUCKET_BUFF_SIZE; /* note the real buffer size */
+		
+		if (sync) {
+			/* After having emitted all chunks, instruct filters like
+			 * mod_deflate to flush.
+			 */
+			//APR_BUCKET_INSERT_AFTER(bucket, passenger_bucket_create(
+			//	data->state, bucket->list));
+		}
 		
 		/* And after this newly created bucket we insert a new Passenger Bucket
 		 * which can read the next chunk from the stream.
@@ -410,7 +203,9 @@ bucket_read(apr_bucket *bucket, const char **str, apr_size_t *len, apr_read_type
 		delete data;
 		bucket->data = NULL;
 		
-		apr_bucket_free(buf);
+		if (buf != NULL) {
+			apr_bucket_free(buf);
+		}
 		
 		bucket = apr_bucket_immortal_make(bucket, "", 0);
 		*str = (const char *) bucket->data;
@@ -423,7 +218,9 @@ bucket_read(apr_bucket *bucket, const char **str, apr_size_t *len, apr_read_type
 		state->errorCode = e;
 		delete data;
 		bucket->data = NULL;
-		apr_bucket_free(buf);
+		if (buf != NULL) {
+			apr_bucket_free(buf);
+		}
 		return APR_FROM_OS_ERROR(e);
 	}
 }

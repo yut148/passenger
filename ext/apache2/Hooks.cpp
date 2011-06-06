@@ -762,8 +762,13 @@ private:
 				 */
 				
 				const char *transferEncoding = apr_table_get(r->headers_out, "Transfer-Encoding");
-				bucketState->chunked = transferEncoding != NULL
-					&& strcmp(transferEncoding, "chunked") == 0;
+				if (transferEncoding != NULL && strcmp(transferEncoding, "chunked") == 0) {
+					P_WARN("TransferEncoding chunked!");
+					apr_table_unset(r->headers_out, "Transfer-Encoding");
+					apr_table_unset(r->headers_out, "Content-Length");
+					apr_table_unset(r->headers_out, "Content-MD5");
+					bucketState->enableDechunking();
+				}
 				
 				/* Manually set the Status header because
 				 * ap_scan_script_header_err_brigade() filters it
