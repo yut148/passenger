@@ -56,6 +56,7 @@
 	#include <sys/event.h>
 	#include <sys/time.h>
 #endif
+#include "c_dechunker.h"
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #ifndef RARRAY_LEN
@@ -78,6 +79,7 @@
 
 static VALUE mPassenger;
 static VALUE mNativeSupport;
+static VALUE cDechunker;
 static VALUE S_ProcessTimes;
 #ifdef HAVE_KQUEUE
 	static VALUE cFileSystemWatcher;
@@ -623,6 +625,73 @@ process_times(VALUE self) {
 	return rb_struct_new(S_ProcessTimes, rb_ull2inum(utime), rb_ull2inum(stime));
 }
 
+
+struct DechunkerSession {
+	VALUE buf;
+};
+
+static void
+Dechunker_onData(const char *data, size_t size, void *userData) {
+	struct DechunkerSession *session = userData;
+	rb_yield(rb_str_substr(session->buf, data - RSTRING_PTR(session->buf), size));
+}
+
+static VALUE
+Dechunker_alloc(VALUE klass) {
+	PassengerDechunker *dck = passenger_dechunker_new();
+	passenger_dechunker_set_data_cb(dck, Dechunker_onData);
+	return Data_Wrap_Struct(klass, NULL, (void (*)()) passenger_dechunker_free, dck);
+}
+
+static VALUE
+Dechunker_reset(VALUE self) {
+	PassengerDechunker *dck;
+	Data_Get_Struct(self, PassengerDechunker, dck);
+	passenger_dechunker_reset(dck);
+	return Qnil;
+}
+
+static VALUE
+Dechunker_feed(VALUE self, VALUE buf) {
+	PassengerDechunker *dck;
+	struct DechunkerSession session;
+	size_t ret;
+
+	Data_Get_Struct(self, PassengerDechunker, dck);
+	passenger_dechunker_set_user_data(dck, &session);
+	session.buf = buf;
+	ret = passenger_dechunker_feed(dck, RSTRING_PTR(buf), RSTRING_LEN(buf));
+	return INT2NUM(ret);
+}
+
+static VALUE
+Dechunker_accepting_input_p(VALUE self) {
+	PassengerDechunker *dck;
+	Data_Get_Struct(self, PassengerDechunker, dck);
+	return passenger_dechunker_accepting_input(dck) ? Qtrue : Qfalse;
+}
+
+static VALUE
+Dechunker_has_error_p(VALUE self) {
+	PassengerDechunker *dck;
+	Data_Get_Struct(self, PassengerDechunker, dck);
+	return passenger_dechunker_has_error(dck) ? Qtrue : Qfalse;
+}
+
+static VALUE
+Dechunker_get_error_message(VALUE self) {
+	PassengerDechunker *dck;
+	const char *msg;
+	Data_Get_Struct(self, PassengerDechunker, dck);
+	msg = passenger_dechunker_get_error_message(dck);
+	if (msg == NULL) {
+		return Qnil;
+	} else {
+		return rb_str_new2(passenger_dechunker_get_error_message(dck));
+	}
+}
+
+
 #if defined(HAVE_KQUEUE) || defined(IN_DOXYGEN)
 typedef struct {
 	VALUE klass;
@@ -1021,6 +1090,14 @@ Init_passenger_native_support() {
 	rb_define_singleton_method(mNativeSupport, "writev3", f_writev3, 4);
 	rb_define_singleton_method(mNativeSupport, "switch_user", switch_user, 3);
 	rb_define_singleton_method(mNativeSupport, "process_times", process_times, 0);
+	
+	cDechunker = rb_define_class_under(mPassenger, "Dechunker", rb_cObject);
+	rb_define_alloc_func(cDechunker, Dechunker_alloc);
+	rb_define_method(cDechunker, "reset", Dechunker_reset, 0);
+	rb_define_method(cDechunker, "feed", Dechunker_feed, 1);
+	rb_define_method(cDechunker, "accepting_input?", Dechunker_accepting_input_p, 0);
+	rb_define_method(cDechunker, "has_error?", Dechunker_has_error_p, 0);
+	rb_define_method(cDechunker, "error_message", Dechunker_get_error_message, 0);
 	
 	#ifdef HAVE_KQUEUE
 		cFileSystemWatcher = rb_define_class_under(mNativeSupport,
