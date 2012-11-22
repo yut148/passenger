@@ -10,7 +10,9 @@
 
 %define gemname passenger
 %if %{?passenger_version:0}%{?!passenger_version:1}
-  %define passenger_version 3.0.2
+  # From Passenger Source
+  # From Passenger Source
+  %define passenger_version 3.0.12
 %endif
 %if %{?passenger_release:0}%{?!passenger_release:1}
   %define passenger_release 1%{?dist}
@@ -18,8 +20,10 @@
 %define passenger_epoch 1
 
 %if %{?nginx_version:0}%{?!nginx_version:1}
-  %define nginx_version 0.8.53
+  # From Passenger Source
+  %define nginx_version 1.0.15
 %endif
+
 %define nginx_release %{passenger_version}_%{passenger_release}
 %define nginx_user	passenger
 %define nginx_group	%{nginx_user}
@@ -33,7 +37,8 @@
 %define httpd_confdir	%{_sysconfdir}/httpd/conf.d
 
 # Macros on the command-line overrides these defaults. You should also
-# make sure these match the binaries found in your PATH
+# make sure these match the binaries found in your PATH. Also, if you
+# change one, you'll probably want to change the others.
 %{?!ruby: %define ruby /usr/bin/ruby}
 %{?!rake: %define rake /usr/bin/rake}
 %{?!gem:  %define gem  /usr/bin/gem}
@@ -41,12 +46,27 @@
 # Debug packages are currently broken. So don't even build them
 %define debug_package %nil
 
-%define ruby_sitelib %(%{ruby} -rrbconfig -e "puts Config::CONFIG['sitelibdir']")
+# Rather than requiring ruby (yum-builddep probably won't have it), set
+# reasonable defaults to get us installed, then once ruby is installed via
+# BuildRequires, it will use the correct values.
+#
+# There is SOME danger here if the values don't match and cause
+# different BuildRequires to be visible. So DON'T DO THAT. :)
+%define ruby_installed %(test -f %{ruby} && test -f %{gem} && echo 1 || echo 0)
 
-%define ruby_version_patch %(%{ruby} -e 'puts "#{RUBY_VERSION}#{defined?(RUBY_PATCHLEVEL) ? %q{.} + RUBY_PATCHLEVEL.to_s : nil}"')
-
-# Does Gem::Version crash&burn on the version defined above? (RHEL might)
-%define broken_gem_version %(%{ruby} -rrubygems -e 'begin ; Gem::Version.create "%{passenger_version}" ; rescue => e ; puts 1 ; exit ; end ; puts 0')
+%if %{ruby_installed}
+  %define ruby_sitelib %(%{ruby} -rrbconfig -e "puts Config::CONFIG['sitelibdir']")
+  %define ruby_version_patch %(%{ruby} -e 'puts "#{RUBY_VERSION}#{defined?(RUBY_PATCHLEVEL) ? %q{.} + RUBY_PATCHLEVEL.to_s : nil}"')
+  # Does Gem::Version crash&burn on the version defined above? (RHEL5 might)
+  %define broken_gem_version %(%{ruby} -rrubygems -e 'begin ; Gem::Version.create "%{passenger_version}" ; rescue => e ; puts 1 ; exit ; end ; puts 0')
+  # %define gemdir %(%{ruby} -rubygems -e 'puts Gem::dir' 2>/dev/null)
+  %define gemdir %(%{gem} env gemdir 2>/dev/null)
+%else
+  %define ruby_sitelib /usr/lib/ruby/site_ruby/1.8
+  %define ruby_version_patch 1.8.7.357
+  %define broken_gem_version 1
+  %define gemdir /usr/lib/ruby/gems/1.8
+%endif
 
 %if %{broken_gem_version}
   # Strip any non-numeric version part
@@ -58,7 +78,6 @@
 # Invoke a shell to do a comparison, silly but it works across versions of RPM
 %define gem_version_mismatch %([ '%{passenger_version}' != '%{gemversion}' ] && echo 1 || echo 0)
 
-%define gemdir %(%{ruby} -rubygems -e 'puts Gem::dir' 2>/dev/null)
 %define geminstdir %{gemdir}/gems/%{gemname}-%{gemversion}
 
 %define perldir %(perl -MConfig -e 'print $Config{installvendorarch}')
@@ -70,8 +89,27 @@
 
 %{!?only_native_libs: %define only_native_libs 0}
 
-# Really wish they'd standardize this
-%define sharedir %{?fedora:%{_datarootdir}}%{?!fedora:%{_datadir}}
+%define is_fedora %{?fedora:1}%{?!fedora:0}
+
+%define is_el6    %{?el6:1}%{?!el6:0}
+# Apparently Amazon is an amalgam of EL5 & EL6. Super.
+%define is_amzn   %{?amzn:1}%{?!amzn:0}
+# There's no macro set for EL5, do it by elimination
+%define is_el5    %{?!fedora:%{?!el6:%{?!amzn:1}}}%{?fedora:0}%{?el6:0}%{?amzn:0}
+
+# It turns out Amazon Linux doesn't have libev afterall
+%define has_libev %{?fedora:1}%{?el6:1}%{?!fedora:%{?!el6:0}}
+
+# They DID standardize, now just legacy support:
+%define sharedir %{?is_el5:%{_datadir}}%{?!is_el5:%{_datarootdir}}
+
+%if %{?fc16:1}%{?!fc16:%{?fc15:1}%{?!fc15:0}}
+  %define unused_patch 1
+  %define nginx_unused_flag -Wno-unused-but-set-variable
+%else
+  %define unused_patch 0
+  %define nginx_unused_flag %nil
+%endif
 
 Summary: Easy and robust Ruby web application deployment
 Name: rubygem-%{gemname}
@@ -85,28 +123,41 @@ Source1: nginx-%{nginx_version}.tar.gz
 Source100: apache-passenger.conf.in
 Source101: nginx-passenger.conf.in
 Source200: rubygem-passenger.te
+Source201: rubygem-passenger.fc.in
+Source202: rubygem-passenger.if
 # The most recent nginx RPM no longer includes this plugin. Remove it from the
 # SRPM
 # # Ignore everything after the ?, it's meant to trick rpmbuild into
 # # finding the correct file
 # Source300: http://github.com/gnosek/nginx-upstream-fair/tarball/master?/nginx-upstream-fair.tar.gz
 Patch0: passenger-force-native.patch
+Patch1: passenger-prevent-dot-cleanup.patch
+Patch2: passenger-standalone-nginx-no-unused-but-set-variable.patch
+Patch3: passenger-standalone-progress-crash-fix.patch
+Patch4: passenger-no-asciidoc-html5.patch
+Patch5: passenger-selinux-aware-helper-agents.patch
+Patch6: passenger-el5-selinux-lacks-open-on-file.patch
 BuildRoot: %{_tmppath}/%{name}-%{passenger_version}-%{passenger_release}-root-%(%{__id_u} -n)
 Requires: rubygems
 Requires: rubygem(rake) >= 0.8.1
 Requires: rubygem(fastthread) >= 1.0.1
 Requires: rubygem(daemon_controller) >= 0.2.5
-Requires: rubygem(file-tail)
 Requires: rubygem(rack)
 BuildRequires: ruby-devel
-BuildRequires: httpd-devel
-BuildRequires: rubygems
-BuildRequires: rubygem(rake) >= 0.8.1
-BuildRequires: rubygem(rack)
-BuildRequires: rubygem(fastthread) >= 1.0.1
-%if %{?fedora:1}%{?!fedora:0}
+BuildRequires: gcc-c++
+#BuildRequires: rubygem(rake) >= 0.8.1
+%if !%{only_native_libs}
+#BuildRequires: httpd-devel
+#BuildRequires: rubygems
+#BuildRequires: rubygem(rack)
+#BuildRequires: rubygem(fastthread) >= 1.0.1
+#BuildRequires: pcre-devel
+%if !%{is_el5}
+BuildRequires: perl-ExtUtils-Embed
 BuildRequires: libcurl-devel
+%if %{is_fedora}
 BuildRequires: source-highlight
+%endif
 %else
 BuildRequires: curl-devel
 %endif
@@ -114,13 +165,13 @@ BuildRequires: doxygen
 BuildRequires: asciidoc
 BuildRequires: graphviz
 # standaline build deps
-%if %{?fedora:1}%{?!fedora:0}
+%if %{has_libev}
 BuildRequires: libev-devel
 %endif
-BuildRequires: rubygem(daemon_controller) >= 0.2.5
-BuildRequires: rubygem(file-tail)
+#BuildRequires: rubygem(daemon_controller) >= 0.2.5
 # native build deps
-%if %{?fedora:1}%{?!fedora:0}
+BuildRequires: libselinux-devel
+%if !%{is_el5}
 BuildRequires: selinux-policy
 %else
 BuildRequires: selinux-policy-devel
@@ -129,7 +180,7 @@ BuildRequires: selinux-policy-devel
 BuildRequires: pcre-devel
 BuildRequires: zlib-devel
 BuildRequires: openssl-devel
-%if %{?fedora:1}%{?!fedora:0}
+%if !%{is_el5}
 BuildRequires: perl-devel
 %else
 BuildRequires: perl
@@ -138,9 +189,11 @@ BuildRequires: perl(ExtUtils::Embed)
 BuildRequires: libxslt-devel
 BuildRequires: GeoIP-devel
 BuildRequires: gd-devel
+%endif # only_native_libs
 # Can't have a noarch package with an arch'd subpackage
 #BuildArch: noarch
 Provides: rubygem(%{gemname}) = %{passenger_version}
+Provides: %{name} = %{passenger_epoch}:%{passenger_version}-%{passenger_release}
 Epoch: %{passenger_epoch}
 
 %description
@@ -160,13 +213,14 @@ version, it is installed as %{gemversion} instead of %{passenger_version}.
 Summary: Phusion Passenger native extensions
 Group: System Environment/Daemons
 Requires: %{name} = %{passenger_epoch}:%{passenger_version}-%{passenger_release}
-%if %{?fedora:1}%{?!fedora:0}
+%if %{has_libev}
 Requires: libev
 %endif
 Requires(post): policycoreutils, initscripts
 Requires(preun): policycoreutils, initscripts
 Requires(postun): policycoreutils
 Epoch: %{passenger_epoch}
+Provides: rubygem-passenger-native = %{passenger_epoch}:%{passenger_version}-%{passenger_release}
 %description native
 Phusion Passenger™ — a.k.a. mod_rails or mod_rack — makes deployment
 of Ruby web applications, such as those built on the revolutionary
@@ -202,9 +256,11 @@ package.
 Summary: Standalone Phusion Passenger Server
 Group: System Environment/Daemons
 Requires: %{name} = %{passenger_epoch}:%{passenger_version}-%{passenger_release}
-%if %{?fedora:1}%{?!fedora:0}
+Requires: %{name}-native-libs = %{passenger_epoch}:%{passenger_version}-%{passenger_release}
+%if %{has_libev}
 Requires: libev
 %endif
+Requires: libselinux
 Epoch: %{passenger_epoch}
 Obsoletes: rubygem-passenger-standalone
 Provides: rubygem-passenger-standalone
@@ -219,7 +275,9 @@ This package contains the standalone Passenger server
 %package -n mod_passenger
 Summary: Apache Module for Phusion Passenger
 Group: System Environment/Daemons
-Requires: %{name}-native = %{passenger_epoch}:%{passenger_version}-%{passenger_release}
+Requires: %{name}-native-libs = %{passenger_epoch}:%{passenger_version}-%{passenger_release}
+Requires: libselinux
+Requires: httpd
 #BuildArch: %_target_arch
 Obsoletes: rubygem-passenger-apache
 Epoch: %{passenger_epoch}
@@ -245,6 +303,7 @@ Requires: perl(:MODULE_COMPAT_%(eval "`%{__perl} -V:version`"; echo $version))
 Requires: GeoIP
 Requires: gd
 Requires: nginx-alternatives
+Requires: libselinux
 Epoch: %{passenger_epoch}
 %description -n nginx-passenger
 Phusion Passenger™ — a.k.a. mod_rails or mod_rack — makes deployment
@@ -266,6 +325,32 @@ This package includes an nginx server with Passenger compiled in.
 # # Fix the CWD
 # %setup -q -T -D -n %{gemname}-%{passenger_version}
 %patch0 -p1
+
+# FC14 doesn't like the Doxygen MD5, and regenerates the files, removing
+# the *.dot files in the process. Prevent that removal
+# %patch1 -p1
+
+%if %unused_patch
+# Nginx doesn't compile with -Wall on F15 or F16, add an argument to the
+# Passenger Standalone build to ignore the fatal warning
+%patch2 -p1
+%endif
+
+# Passenger standalone progress notification crashes consistently when
+# built in mock, yet not outside of it. Very strange. Stranger, I got my
+# first crash outside of mock.
+%patch3 -p1
+
+# They're using a newer version of asciidoc than is currently available,
+# even on FC15. This should be revisited for FC16
+%patch4 -p1
+
+# Make HelperAgent transition back to httpd_t on the ruby exec
+%patch5 -p1
+
+# FC14 doesn't like the new doxygen sources at all, removing them to
+# regenerate all of it, per Hong Li's recommendation
+rm -rf doc/cxxapi
 
 # Rather than hard-coding the path into the patch, change it here so
 # that it's consistent with the %{ruby} macro, which might be defined on
@@ -291,9 +376,19 @@ perl -pi -e "s{(PREFERRED_NGINX_VERSION\s*=\s*(['\"]))[\d\.]+\2}{\${1}%{nginx_ve
 # RPM finds these in shebangs and assumes they're requirements. Clean them up here rather than in the install-dir.
 find test -type f -print0 | xargs -0 perl -pi -e '%{perlfileck} s{#!(/opt/ruby.*|/usr/bin/ruby1.8)}{%{ruby}}g'
 
+### SELINUX
+rm -rf selinux
+mkdir selinux
+cd selinux
+cp %{SOURCE200} %{SOURCE202} .
+perl -pe 's{%%GEMDIR%%}{%geminstdir}g;s{%%VAR%%}{%_var}g' %{SOURCE201} > rubygem-passenger.fc
+%if %is_el5
+%patch6
+%endif
+cd ..
 
 %build
-%if %{?fedora:1}%{?!fedora:0}
+%if %{has_libev}
 export USE_VENDORED_LIBEV=false
 # This isn't honored
 # export CFLAGS='%optflags -I/usr/include/libev'
@@ -301,20 +396,31 @@ export LIBEV_CFLAGS='-I/usr/include/libev'
 export LIBEV_LIBS='-lev'
 %endif
 
+%if %is_el6
+%ifarch x86_64
+# x86_64 EL6 build started crashing when source-highlight was not
+# present. That is probably the CORRECT behavior. But it's inconsistent
+# & inconvenient.
+mkdir new_path
+export PATH=$PATH:$PWD/new_path
+cat <<EOF > new_path/source-highlight
+#!/bin/sh
+echo "source-highlight not installed!" >&2
+exit 0
+EOF
+chmod +x new_path/source-highlight
+%endif
+%endif
+
 %if %{only_native_libs}
    %{rake} native_support
 %else
   %{rake} package
   %{rake} apache2
+  %{rake} nginx
 
   ### SELINUX
-  rm -rf selinux
-  mkdir selinux
   cd selinux
-  cp %{SOURCE200} .
-  echo '%{geminstdir}/agents/((apache2|nginx)/)?Passenger.*	system_u:object_r:httpd_exec_t:s0' > rubygem-passenger.fc
-  echo '%{_var}/log/passenger-analytics	system_u:object_r:httpd_log_t:s0' >> rubygem-passenger.fc
-  touch rubygem-passenger.if
   make -f %{sharedir}/selinux/devel/Makefile
   cd ..
 
@@ -325,8 +431,8 @@ export LIBEV_LIBS='-lev'
   # I'm not sure why this fails on RHEL but not Fedora. I guess GCC 4.4 is
   # smarter about it than 4.1? It feels wrong to do this, but I don't see
   # an easier way out.
-  %if %{?fedora:1}%{?!fedora:0}
-    %define nginx_ccopt %{optflags}
+  %if !%{is_el5}
+    %define nginx_ccopt %{optflags} %{nginx_unused_flag}
   %else
     %define nginx_ccopt %(echo "%{optflags}" | sed -e 's/SOURCE=2/& -Wno-unused/')
   %endif
@@ -367,6 +473,7 @@ export LIBEV_LIBS='-lev'
     --with-file-aio \
     --with-mail_ssl_module \
     --with-ipv6 \
+    --add-module="$RPM_BUILD_DIR/passenger-%{passenger_version}/ext/nginx" \
     --with-cc-opt="%{nginx_ccopt} $(pcre-config --cflags)" \
     --with-ld-opt="-Wl,-E" # so the perl module finds its symbols
 
@@ -385,7 +492,7 @@ export LIBEV_LIBS='-lev'
 %endif # !only_native_libs
 
 %install
-%if %{?fedora:1}%{?!fedora:0}
+%if %{has_libev}
 export USE_VENDORED_LIBEV=false
 # This isn't honored
 # export CFLAGS='%optflags -I/usr/include/libev'
@@ -414,6 +521,9 @@ mkdir -p %{buildroot}/%{nginx_confdir}
 mkdir -p %{buildroot}/%{nginx_logdir}
 mkdir -p %{buildroot}/%{httpd_confdir}
 mkdir -p %{buildroot}/%{_var}/log/passenger-analytics
+
+# The %ghost must be created?
+mkdir -p %{buildroot}/%{_var}/run/rubygem-passenger
 
 # I should probably figure out how to get these into the gem
 cp -ra agents %{buildroot}/%{geminstdir}
@@ -483,7 +593,7 @@ rm -f $native_dir/support/ext/libev/config.log
 rm %{buildroot}/%{geminstdir}/DEVELOPERS.TXT
 
 # This is still needed
-%if %{?fedora:1}%{?!fedora:0}
+%if %{has_libev}
   %define libevmunge %nil
 %else
   %define libevmunge $native_dir/support/ext/libev/config.status $native_dir/support/ext/libev/Makefile
@@ -520,6 +630,11 @@ EOF
     find %{buildroot}/%{geminstdir} \\( -type d \\( -name native -o -name agents \\) \\) -prune -o \\( -type f -print \\) | perl -pe 's{^%{buildroot}}{};s{^//}{/};s/([?|*'\\''\"])/\\\\$1/g;s{(^|\\n$)}{\"$&}g' >> %{base_files} \
     %{__arch_install_post}
 
+%post -n mod_passenger
+if [ $1 == 1 ]; then
+  fixfiles -R mod_passenger restore
+fi
+
 %post -n nginx-passenger
 if [ $1 == 1 ]; then
   /usr/sbin/alternatives --install /usr/sbin/nginx nginx \
@@ -531,32 +646,40 @@ if [ $1 == 1 ]; then
     --slave %{perldir}/nginx.pm nginx.pm %{perldir}/nginx_passenger.pm \
     --slave %{_mandir}/man3/nginx.3pm.gz nginx.man \
 	    %{_mandir}/man3/nginx_passenger.3pm.gz
+  fixfiles -R nginx-passenger restore
+  # It appears that the EPEL nginx package has no SELinux configuration, use our policy for now
+  fixfiles -R nginx restore
 fi
 
 %postun -n nginx-passenger
-if [ $1 == 0 ]; then
+if [ $1 == 0 ]; then # final removal
   /usr/sbin/alternatives --remove nginx /usr/sbin/nginx.passenger
 fi
 
 %post native
-if [ "$1" -le "1" ] ; then # First install
+# Always install the module, otherwise upgrades will have the old version
+# if [ "$1" -le "1" ] ; then # First install
+# semodule -i %{sharedir}/selinux/packages/%{name}/%{name}.pp 2>/dev/null || :
+# fi
 semodule -i %{sharedir}/selinux/packages/%{name}/%{name}.pp 2>/dev/null || :
 fixfiles -R %{name} restore
 fixfiles -R %{name}-native restore
-fi
 
 %preun native
 if [ "$1" -lt "1" ] ; then # Final removal
-semodule -r rubygem_%{gemname} 2>/dev/null || :
-fixfiles -R %{name} restore
-fixfiles -R %{name}-native restore
+  semodule -r rubygem_%{gemname} 2>/dev/null || :
+else
+  fixfiles -R %{name} restore
+  fixfiles -R %{name}-native restore
 fi
 
 %postun native
+# This doesn't seem to be running
 if [ "$1" -ge "1" ] ; then # Upgrade
 semodule -i %{sharedir}/selinux/packages/%{name}/%{name}.pp 2>/dev/null || :
 fi
 %endif # !only_native_libs
+
 
 %clean
 rm -rf %{buildroot}
@@ -565,20 +688,24 @@ rm -rf %{buildroot}
 %files -f %{base_files}
 
 %files native
-%{geminstdir}/agents
+%{geminstdir}/agents/PassengerLoggingAgent
+%{geminstdir}/agents/PassengerWatchdog
 %{sharedir}/selinux/packages/%{name}/%{name}.pp
 %{_var}/log/passenger-analytics
+%ghost %dir %{_var}/run/rubygem-passenger
 
 %files -n passenger-standalone
 %doc doc/Users\ guide\ Standalone.html
 %doc doc/Users\ guide\ Standalone.txt
 %{_bindir}/passenger
 %{_var}/lib/passenger-standalone/natively-packaged/
+%attr(755, root, root) %{_var}/lib/passenger-standalone/natively-packaged/support/helper-scripts/*
 
 %files -n mod_passenger
 %doc doc/Users\ guide\ Apache.html
 %doc doc/Users\ guide\ Apache.txt
 %{_libdir}/httpd/modules/mod_passenger.so
+%{geminstdir}/agents/apache2
 %config %{httpd_confdir}/passenger.conf
 
 %files -n nginx-passenger
@@ -586,6 +713,7 @@ rm -rf %{buildroot}
 %doc doc/Users\ guide\ Nginx.txt
 %config %{nginx_confdir}/conf.d/passenger.conf
 /usr/sbin/nginx.passenger
+%{geminstdir}/agents/nginx
 %{perldir}/auto/nginx/nginx*
 %{perldir}/nginx*
 %{_mandir}/man3/nginx*
@@ -597,6 +725,90 @@ rm -rf %{buildroot}
 
 
 %changelog
+* Wed Apr 15 2012 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.12-1
+- Bump to 3.0.12
+- Includes nginx bump to 1.0.15
+
+* Sat Jan 21 2012  Erik Ogan <erik@steathymonkeys.com> - 1:3.0.11-9
+- Bump preferred nginx to 1.0.11
+
+* Wed Dec 21 2011 Darrell Fuhriman <darrell@renewfund.com> - 1:3.0.11-8
+- Relocated PassengerTempDir to avoid conflicts with system selinux-policy
+- Reduced the amount of unecessary log noise on {CentOS/RHEL}{5,6}
+
+* Mon Nov 28 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.11-1
+- Bump version to 3.0.11
+
+* Sun Nov 27 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.10-1
+- Bump version to 3.0.10
+- Bump nginx version to 1.0.10
+
+* Sat Nov 12 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.9-2
+- Added support for Fedora 16
+- Added explicit Provides: tags to avoid problems with Requires: in
+  sub-packages (Thanks to Viliam Pucik)
+
+* Sun Sep  4 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.9-1
+- Added a new SELinux boolean (httpd_passenger_use_shared_libs) to allow
+  applications to load gems with native code. It is off by default.
+  Thanks to Darrell for this patch!
+- Moved Apache's PassengerTempDir to /var/run/passenger. A better solution than
+  the policy module changes:
+  https://bugzilla.redhat.com/show_bug.cgi?id=730837
+- Bump Passenger to 3.0.9
+- Bump nginx to 1.0.6
+
+* Fri Aug 12 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.8-2
+- Fix the libev dependency for EL6
+
+* Wed Aug  3 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.8-1
+- Bump version to 3.0.8
+- Bump nginx to 1.0.5
+
+* Sun Jul 31 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.7-5
+- Fix segfault when SELinux is disabled
+- Fix mod_passenger's native-libs dependency
+- Add httpd to the list of mod_passenger dependencies
+
+* Thu Jul  7 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.7-4
+- Move PassengerHelperAgent to its own SELinux domain
+- Bump nginx to 1.0.2
+- Add support for FC15
+- Add support for RHEL6
+- Fix passenger-standalone dependencies and script permissions
+
+* Sun Apr 17 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.7-3
+- Remove file-tail from BuildRequire as well
+
+* Thu Apr 14 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.7-2
+- Add SELinux permissions for ps (and a boolean to turn it off: httpd_use_ps)
+
+* Thu Apr 14 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.7-1
+- Bump version to 3.0.7
+- Bump nginx version 1.0.0
+
+* Mon Apr  4 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.6-2
+- Removing requirement on file-tail
+
+* Sun Apr  3 2011 Erik Ogan <erik@steathymonkeys.com> - 1:3.0.6-1
+- Bump to 3.0.6
+
+* Fri Mar 11 2011 Erik Ogan <erik@stealthymonkeys.com> - 1:3.0.5-1
+- Bump to 3.0.5
+
+* Wed Mar  2 2011 Erik Ogan <erik@stealthymonkeys.com> - 1:3.0.4-1
+- Bump to 3.0.4
+
+* Fri Feb 25 2011 Erik Ogan <erik@stealthymonkeys.com> - 1:3.0.3-1
+- Bump to 3.0.3
+
+* Sat Feb  5 2011 Erik Ogan <erik@stealthymonkeys.com> - 3.0.2-2
+- Bump nginx to 0.8.54
+- Fix nginx-passenger to include passenger (somehow this got lost in the
+  shuffle, yet tests continued to pass. Testing updated as well)
+- Move agents/apache2 & agents/nginx into their respective packages
+- Fix BuildRequires when only_native_libs is defined
+
 * Thu Dec 16 2010 Erik Ogan <erik@stealthymonkeys.com> - 3.0.2-1
 - Bump to 3.0.2
 
